@@ -13,6 +13,27 @@ from common.utils import expand_path
 DEFAULT_LIMIT = 500
 
 
+def _resolve_limit(value) -> int:
+    """``limit`` as a usable entry count.
+
+    The JSON schema declares an integer, but the value arrives from model
+    output and is not guaranteed to be one: ``null``, ``"20"`` and ``1.5`` all
+    turn up. Handed straight to ``len(results) >= limit``, a string raises
+    TypeError and surfaces as a bare "Error listing directory" instead of a
+    listing, and anything <= 0 makes that first comparison true, so a populated
+    directory is reported as "(empty directory)".
+
+    A value that is not a number falls back to the default, and a limit below
+    one is raised to one: a maximum of zero entries cannot be represented, and
+    the entry-limit notice then points at the next value to ask for.
+    """
+    try:
+        limit = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_LIMIT
+    return max(1, limit)
+
+
 class Ls(BaseTool):
     """Tool for listing directory contents"""
     
@@ -46,7 +67,7 @@ class Ls(BaseTool):
         :return: Directory contents or error
         """
         path = args.get("path", ".").strip()
-        limit = args.get("limit", DEFAULT_LIMIT)
+        limit = _resolve_limit(args.get("limit", DEFAULT_LIMIT))
         
         # Resolve path
         absolute_path = self._resolve_path(path)
