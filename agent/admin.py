@@ -813,6 +813,13 @@ class AgentAdminService:
     def read_core_file(self, agent_id: str, filename: str) -> Dict:
         with self._lock:
             path = self._core_path(agent_id, filename)
+            # write_core_file refuses content over MAX_CORE_FILE_BYTES, so a core
+            # file cannot grow past that through the API -- but the agent's own
+            # write/edit tools have no such limit. Reading one whole would pull a
+            # multi-megabyte string into memory and then into a JSON response, so
+            # the same cap is enforced here and surfaced as a 4xx.
+            if path.exists() and path.stat().st_size > MAX_CORE_FILE_BYTES:
+                raise AgentAdminError("core file exceeds 1 MiB")
             raw = path.read_bytes() if path.exists() else b""
             return {
                 "filename": filename,
