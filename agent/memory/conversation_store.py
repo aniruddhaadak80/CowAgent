@@ -168,6 +168,73 @@ _MIGRATION_ADD_MSG_AGENT_ID = """
 ALTER TABLE messages ADD COLUMN agent_id TEXT NOT NULL DEFAULT '';
 """
 
+# Rebuild of both conversation tables under the composite keys the current
+# ``_DDL`` declares. Held as a tuple of single statements rather than one script
+# because the rebuild has to be all-or-nothing and ``executescript()`` cannot
+# give it that: it commits any open transaction before it runs and then executes
+# the rest in autocommit, so an interruption between the copy and the rename
+# would strand the rows in a ``*_new`` table and leave the originals dropped for
+# good. Executed one statement at a time inside a single transaction, any
+# failure rolls the file back to the shape it had before.
+_COMPOSITE_KEY_REBUILD = (
+    "DROP INDEX IF EXISTS idx_messages_session",
+    "DROP INDEX IF EXISTS idx_sessions_last_active",
+    """
+    CREATE TABLE sessions_new (
+        agent_id          TEXT    NOT NULL DEFAULT '',
+        session_id        TEXT    NOT NULL,
+        channel_type      TEXT    NOT NULL DEFAULT '',
+        title             TEXT    NOT NULL DEFAULT '',
+        context_start_seq INTEGER NOT NULL DEFAULT 0,
+        created_at        INTEGER NOT NULL,
+        last_active       INTEGER NOT NULL,
+        msg_count         INTEGER NOT NULL DEFAULT 0,
+        pinned            INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (agent_id, session_id)
+    )
+    """,
+    """
+    INSERT INTO sessions_new
+        (agent_id, session_id, channel_type, title, context_start_seq,
+         created_at, last_active, msg_count, pinned)
+    SELECT agent_id, session_id, channel_type, title, context_start_seq,
+           created_at, last_active, msg_count, pinned
+    FROM sessions
+    """,
+    "DROP TABLE sessions",
+    "ALTER TABLE sessions_new RENAME TO sessions",
+    """
+    CREATE TABLE messages_new (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        agent_id     TEXT    NOT NULL DEFAULT '',
+        session_id   TEXT    NOT NULL,
+        seq          INTEGER NOT NULL,
+        role         TEXT    NOT NULL,
+        content      TEXT    NOT NULL,
+        created_at   INTEGER NOT NULL,
+        extras       TEXT    NOT NULL DEFAULT '',
+        run_id       TEXT    NOT NULL DEFAULT '',
+        UNIQUE (agent_id, session_id, seq)
+    )
+    """,
+    """
+    INSERT INTO messages_new
+        (id, agent_id, session_id, seq, role, content, created_at, extras, run_id)
+    SELECT id, agent_id, session_id, seq, role, content, created_at, extras, run_id
+    FROM messages
+    """,
+    "DROP TABLE messages",
+    "ALTER TABLE messages_new RENAME TO messages",
+    """
+    CREATE INDEX IF NOT EXISTS idx_messages_session
+        ON messages (agent_id, session_id, seq)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_sessions_last_active
+        ON sessions (agent_id, last_active)
+    """,
+)
+
 # Bookkeeping for the one-time, idempotent global migration. Lives in the
 # global file itself so "have we already absorbed source X?" survives restarts
 # without a side-car file. Mirrors the scheduler's ``_migrate_legacy_task_stores``
@@ -2188,8 +2255,12 @@ class ConversationStore:
 
         Detected by inspecting the primary key of ``sessions``: a single-column
         PK means the old shape. The rebuild is the classic SQLite
-        create-new / copy / drop / rename, wrapped in one transaction so an
-        interruption rolls back to the old shape rather than a half-migrated one.
+        create-new / copy / drop / rename, run statement by statement inside one
+        transaction so an interruption rolls back to the old shape rather than a
+        half-migrated one -- the rows exist in exactly one place at every step,
+        so any partial state left behind is data loss. The statements are
+        therefore run with ``execute`` and never with ``executescript``, which
+        would commit first and take the transaction with it.
         Restricted by the caller to installs that actually need it (more than
         one Agent), so the vast single-Agent majority never rebuilds.
         """
@@ -2205,56 +2276,9 @@ class ConversationStore:
             "(agent_id, session_id) keys for multi-Agent merge"
         )
         with conn:
-            conn.execute("DROP INDEX IF EXISTS idx_messages_session")
-            conn.execute("DROP INDEX IF EXISTS idx_sessions_last_active")
-            conn.executescript(
-                """
-                CREATE TABLE sessions_new (
-                    agent_id          TEXT    NOT NULL DEFAULT '',
-                    session_id        TEXT    NOT NULL,
-                    channel_type      TEXT    NOT NULL DEFAULT '',
-                    title             TEXT    NOT NULL DEFAULT '',
-                    context_start_seq INTEGER NOT NULL DEFAULT 0,
-                    created_at        INTEGER NOT NULL,
-                    last_active       INTEGER NOT NULL,
-                    msg_count         INTEGER NOT NULL DEFAULT 0,
-                    pinned            INTEGER NOT NULL DEFAULT 0,
-                    PRIMARY KEY (agent_id, session_id)
-                );
-                INSERT INTO sessions_new
-                    (agent_id, session_id, channel_type, title, context_start_seq,
-                     created_at, last_active, msg_count, pinned)
-                SELECT agent_id, session_id, channel_type, title, context_start_seq,
-                       created_at, last_active, msg_count, pinned
-                FROM sessions;
-                DROP TABLE sessions;
-                ALTER TABLE sessions_new RENAME TO sessions;
-
-                CREATE TABLE messages_new (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    agent_id     TEXT    NOT NULL DEFAULT '',
-                    session_id   TEXT    NOT NULL,
-                    seq          INTEGER NOT NULL,
-                    role         TEXT    NOT NULL,
-                    content      TEXT    NOT NULL,
-                    created_at   INTEGER NOT NULL,
-                    extras       TEXT    NOT NULL DEFAULT '',
-                    run_id       TEXT    NOT NULL DEFAULT '',
-                    UNIQUE (agent_id, session_id, seq)
-                );
-                INSERT INTO messages_new
-                    (id, agent_id, session_id, seq, role, content, created_at, extras, run_id)
-                SELECT id, agent_id, session_id, seq, role, content, created_at, extras, run_id
-                FROM messages;
-                DROP TABLE messages;
-                ALTER TABLE messages_new RENAME TO messages;
-
-                CREATE INDEX IF NOT EXISTS idx_messages_session
-                    ON messages (agent_id, session_id, seq);
-                CREATE INDEX IF NOT EXISTS idx_sessions_last_active
-                    ON sessions (agent_id, last_active);
-                """
-            )
+            conn.execute("BEGIN")
+            for statement in _COMPOSITE_KEY_REBUILD:
+                conn.execute(statement)
 
     def _connect(self) -> sqlite3.Connection:
         with self._lock:
