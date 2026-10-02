@@ -501,11 +501,15 @@ class MinimaxBot(Bot):
             # Add tool calls if present
             if message.get("tool_calls"):
                 for tool_call in message["tool_calls"]:
+                    try:
+                        tool_input = json.loads(tool_call["function"]["arguments"])
+                    except (json.JSONDecodeError, TypeError):
+                        tool_input = {}
                     response_data["content"].append({
                         "type": "tool_use",
                         "id": tool_call["id"],
                         "name": tool_call["function"]["name"],
-                        "input": json.loads(tool_call["function"]["arguments"])
+                        "input": tool_input
                     })
 
             # Set stop_reason
