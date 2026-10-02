@@ -197,7 +197,10 @@ def xunfei_asr(APPID,APISecret,APIKey,BusinessArgsASR,AudioFile):
     wsUrl = wsParam.create_url()
     ws = websocket.WebSocketApp(wsUrl, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.on_open = on_open
-    ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE})
+    # 校验服务端证书：authorization参数里带有api_key和签名，关掉校验等于把凭证
+    # 和识别结果都交给中间人。默认context即可，打包版缺少OpenSSL证书库时
+    # app.run()已经通过ensure_ca_bundle()补上。
+    ws.run_forever(sslopt={"context": ssl.create_default_context()})
     #把字典的值合并起来做最后识别的输出
     whole_words = ""
     for i in sorted(whole_dict.keys()):
