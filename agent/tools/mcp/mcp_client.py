@@ -1035,15 +1035,39 @@ class McpClientRegistry:
             return dict(self._clients)
 
     def shutdown_all(self) -> None:
-        """Shut down all managed clients."""
+        """Shut down all managed clients, the shared pool included."""
         with self._registry_lock:
             clients = list(self._clients.values())
             self._clients.clear()
 
-        for client in clients:
+        # A pooled client is normally registered in _clients as well (the
+        # loader does that once the server's tools are live), so the same object
+        # can turn up in both lists -- tear each one down exactly once.
+        stopped = set()
+        for client in clients + self._drain_shared_pool():
+            if id(client) in stopped:
+                continue
+            stopped.add(id(client))
             try:
                 client.shutdown()
             except Exception as e:
                 logger.warning(f"[MCP] Error shutting down '{client.name}': {e}")
 
         logger.info("[MCP] All servers shut down")
+
+    def _drain_shared_pool(self) -> list:
+        """Empty the shared pool and return the clients it held.
+
+        The pool is keyed by the *source* config so that several Agents on one
+        mcp.json reuse a single subprocess. Those entries are real subprocesses
+        with reader threads attached, so a shutdown that only walked _clients
+        left every shared server running -- and because the entry survived, the
+        next reload was handed the process shutdown had just been asked to
+        stop, or forked a new one and orphaned the old for good. The pool is
+        emptied before any teardown runs, so a client that raises on shutdown
+        cannot strand the ones after it.
+        """
+        with self._shared_pool_lock:
+            pooled = list(self._shared_pool.values())
+            self._shared_pool.clear()
+        return pooled
