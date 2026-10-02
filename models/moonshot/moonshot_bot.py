@@ -161,8 +161,16 @@ class MoonshotBot(Bot):
                     "content": response["choices"][0]["message"]["content"]
                 }
             else:
-                response = res.json()
-                error = response.get("error")
+                # A gateway or proxy in front of the API answers failures with
+                # bodies of its own: an HTML error page that res.json() cannot
+                # parse, or JSON that puts the message at the top level instead
+                # of under "error". Guard both, so the status-code branch below
+                # is still reached and the real reason still gets logged.
+                try:
+                    response = res.json()
+                    error = response.get("error", response)
+                except Exception:
+                    error = {"message": res.text[:300]}
                 logger.error(f"[MOONSHOT] chat failed, status_code={res.status_code}, "
                              f"msg={error.get('message')}, type={error.get('type')}")
 
