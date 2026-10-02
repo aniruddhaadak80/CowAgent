@@ -176,7 +176,10 @@ def xunfei_tts(APPID, APIKey, APISecret,BusinessArgsTTS, Text, OutFile):
     wsUrl = wsParam.create_url()
     ws = websocket.WebSocketApp(wsUrl, on_message=on_message, on_error=on_error, on_close=on_close)
     ws.on_open = on_open
-    ws.run_forever(sslopt={"cert_reqs": ssl.CERT_NONE},
+    # 校验服务端证书：authorization是用APISecret签名的，关掉校验等于把凭证
+    # 和合成出来的音频都交给中间人。默认context即可，打包版缺少OpenSSL证书库时
+    # app.run()已经通过ensure_ca_bundle()补上。
+    ws.run_forever(sslopt={"context": ssl.create_default_context()},
                    ping_interval=WS_PING_INTERVAL,
                    ping_timeout=WS_PING_TIMEOUT)
     if stream_error:
