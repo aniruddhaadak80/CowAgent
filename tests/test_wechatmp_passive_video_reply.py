@@ -9,6 +9,12 @@ saw a blank reply, and not one line was logged. Worse, the ``voice`` and
 ``image`` branches are the ones that schedule ``delete_media``, so the uploaded
 video was never released and stayed in the material store forever.
 
+The same harness also drives the message that arrives *while* a turn is still
+running. The "is this a new request?" guard used per-user state for a question
+that WeChat answers per-message, so a follow-up typed mid-turn matched neither of
+its clauses: it was never handed to the agent, and the POST answered it with the
+in-flight turn's already-cached segments instead.
+
 ``passive_reply`` imports ``web`` at module scope, so a stub has to be in
 ``sys.modules`` before that import. The real ``web.py`` *is* installed here, so
 -- unlike the ``try: import web / except ImportError`` guard the other modules
@@ -23,19 +29,28 @@ from collections import defaultdict
 
 import pytest
 
-TEXT_XML = (
-    b"<xml>"
-    b"<ToUserName><![CDATA[gh_test]]></ToUserName>"
-    b"<FromUserName><![CDATA[oUser1]]></FromUserName>"
-    b"<CreateTime>1700000000</CreateTime>"
-    b"<MsgType><![CDATA[text]]></MsgType>"
-    b"<Content><![CDATA[hi]]></Content>"
-    b"<MsgId>1234567890</MsgId>"
-    b"</xml>"
-)
+from bridge.context import Context
+
+
+def _text_xml(content, msg_id):
+    return (
+        b"<xml>"
+        b"<ToUserName><![CDATA[gh_test]]></ToUserName>"
+        b"<FromUserName><![CDATA[oUser1]]></FromUserName>"
+        b"<CreateTime>1700000000</CreateTime>"
+        b"<MsgType><![CDATA[text]]></MsgType>"
+        b"<Content><![CDATA[" + content.encode("utf-8") + b"]]></Content>"
+        b"<MsgId>" + str(msg_id).encode("ascii") + b"</MsgId>"
+        b"</xml>"
+    )
+
+
+TEXT_XML = _text_xml("hi", 1234567890)
 
 FROM_USER = "oUser1"
 MEDIA_ID = "MEDIA-VIDEO-1"
+MESSAGE_ID = 1234567890
+EARLIER_REPLY = "the reply the in-flight turn already produced"
 
 
 class _Args(dict):
@@ -50,10 +65,15 @@ class _Args(dict):
 
 @pytest.fixture
 def web_stub(monkeypatch):
-    """A ``web`` module good enough for a single POST, with no request context."""
+    """A ``web`` module good enough for a single POST, with no request context.
+
+    ``data`` reads ``stub.payload`` on every call so a test can decide which
+    message WeChat "sent" without rebuilding the stub.
+    """
     stub = types.ModuleType("web")
     stub.ctx = types.SimpleNamespace(env={})
-    stub.data = lambda: TEXT_XML
+    stub.payload = TEXT_XML
+    stub.data = lambda: stub.payload
     stub.input = lambda **kwargs: _Args(signature="sig", timestamp="1", nonce="n")
     stub.Forbidden = type("Forbidden", (Exception,), {})
     monkeypatch.setitem(sys.modules, "web", stub)
@@ -85,26 +105,41 @@ def passive_reply(web_stub, monkeypatch):
 class FakeChannel:
     """Only the passive-reply state that ``Query.POST`` actually touches."""
 
-    def __init__(self, segments):
+    def __init__(self, segments, running=(), request_cnt=None):
         self.crypto = None
         self.cache_dict = defaultdict(list)
         self.cache_dict[FROM_USER].extend(segments)
-        self.running = set()
-        self.request_cnt = {}
+        self.running = set(running)
+        self.request_cnt = {} if request_cnt is None else request_cnt
         self.client = object()
         self.delete_media_loop = object()
         self.deleted = []
+        self.produced = []
 
     async def delete_media(self, media_id):
         self.deleted.append(media_id)
 
+    def _compose_context(self, ctype, content, **kwargs):
+        # The real one stamps session_id/receiver/msg, and the queue key
+        # ChatChannel.produce() files a turn under is that session_id.
+        return Context(ctype, content, {
+            "session_id": FROM_USER,
+            "receiver": FROM_USER,
+            "msg": kwargs.get("msg"),
+        })
 
-def _post(module, monkeypatch, segments):
+    def produce(self, context):
+        self.produced.append(context)
+
+
+def _post(module, monkeypatch, segments, running=(), request_cnt=None, payload=None):
     """Drive one POST over ``segments`` and report what came back."""
-    channel = FakeChannel(segments)
+    channel = FakeChannel(segments, running=running, request_cnt=request_cnt)
     scheduled = []
     drain = asyncio.new_event_loop()
     try:
+        if payload is not None:
+            module.web.payload = payload
 
         def run_coroutine_threadsafe(coro, loop):
             scheduled.append(loop)
@@ -157,3 +192,54 @@ def test_a_segment_that_cannot_be_rendered_still_releases_its_media(passive_repl
     assert result == "success"
     assert scheduled == [channel.delete_media_loop]
     assert channel.deleted == [MEDIA_ID]
+
+
+FOLLOW_UP = "and while you were busy, run the tests instead"
+FOLLOW_UP_ID = MESSAGE_ID + 1
+FOLLOW_UP_XML = _text_xml(FOLLOW_UP, FOLLOW_UP_ID)
+
+
+def _post_mid_turn(module, monkeypatch, **kwargs):
+    """A brand-new message arriving while a turn for the same openid runs."""
+    return _post(
+        module,
+        monkeypatch,
+        [("text", EARLIER_REPLY)],
+        running={FROM_USER},
+        payload=FOLLOW_UP_XML,
+        **kwargs,
+    )
+
+
+def test_a_message_that_arrives_mid_turn_is_handed_to_the_agent(passive_reply, monkeypatch):
+    """The follow-up is a new message_id, so it is a new request.
+
+    ``ChatChannel.produce`` serialises per session, so handing it over mid-turn
+    is what queues it behind the running turn instead of losing it.
+    """
+    _result, channel, _scheduled = _post_mid_turn(passive_reply, monkeypatch)
+
+    assert [context.content for context in channel.produced] == [FOLLOW_UP]
+
+
+def test_a_message_that_arrives_mid_turn_is_not_answered_with_the_earlier_reply(passive_reply, monkeypatch):
+    """The cached segments belong to the in-flight turn, not to this message."""
+    result, _channel, _scheduled = _post_mid_turn(passive_reply, monkeypatch)
+
+    assert EARLIER_REPLY not in str(result)
+
+
+def test_the_earlier_reply_stays_cached_when_a_message_arrives_mid_turn(passive_reply, monkeypatch):
+    """Holding it back must not discard it -- it is still undelivered output."""
+    _result, channel, _scheduled = _post_mid_turn(passive_reply, monkeypatch)
+
+    assert channel.cache_dict[FROM_USER] == [("text", EARLIER_REPLY)]
+
+
+def test_a_wechat_retry_of_the_same_message_does_not_start_a_second_turn(passive_reply, monkeypatch):
+    """WeChat re-POSTs one message_id up to three times; only the first runs it."""
+    _result, channel, _scheduled = _post_mid_turn(
+        passive_reply, monkeypatch, request_cnt={FOLLOW_UP_ID: 1},
+    )
+
+    assert channel.produced == []

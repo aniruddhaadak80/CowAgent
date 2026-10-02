@@ -47,12 +47,13 @@ class Query:
                 if "【收到不支持的消息类型，暂无法显示】" in content:
                     supported = False  # not supported, used to refresh
 
+                steered = False
+
                 # New request
-                if (
+                if message_id not in channel.request_cnt and (
                     channel.cache_dict.get(from_user) is None
-                    and from_user not in channel.running
-                    or content.startswith("#")
-                    and message_id not in channel.request_cnt  # insert the godcmd
+                    or from_user in channel.running
+                    or content.startswith("#")  # insert the godcmd
                 ):
                     # The first query begin
                     if msg.type == "voice" and wechatmp_msg.ctype == ContextType.TEXT and conf().get("voice_reply_voice", False):
@@ -62,6 +63,7 @@ class Query:
                     logger.debug("[wechatmp] context: {} {} {}".format(context, wechatmp_msg, supported))
 
                     if supported and context:
+                        steered = from_user in channel.running
                         channel.running.add(from_user)
                         channel.produce(context)
                     else:
@@ -99,6 +101,9 @@ class Query:
                         request_cnt, from_user, message_id, web.ctx.env.get("REMOTE_ADDR"), web.ctx.env.get("REMOTE_PORT"), content
                     )
                 )
+
+                if steered:
+                    return "success"
 
                 task_running = True
                 waiting_until = request_time + 4
