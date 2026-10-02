@@ -4,10 +4,12 @@ import ipaddress
 import json
 import re
 import socket
+from contextlib import nullcontext
 from typing import Callable, Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from common.markdown_fence import transform_outside_fences
 
@@ -116,8 +118,15 @@ def resolve_markdown_images(
     return _outside_code(text or "", lambda chunk: _MARKDOWN_IMAGE.sub(replace, chunk))
 
 
-def validate_public_image_url(url: str) -> None:
-    """Reject non-HTTP and non-public image targets before downloading."""
+def validate_public_image_url(url: str) -> str:
+    """Reject non-HTTP and non-public image targets, returning the address vetted.
+
+    The address is returned rather than discarded because the caller has to
+    connect to *this* answer: a hostname resolves again inside requests, and a
+    name with a short TTL can answer the first lookup publicly and the second
+    with a loopback or private address, which would leave this verdict stale
+    by the time a socket is opened.
+    """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         raise ValueError("unsupported image URL scheme")
@@ -150,62 +159,133 @@ def validate_public_image_url(url: str) -> None:
         ):
             raise ValueError("image URL resolves to a non-public address")
 
+    # Any address may serve the request, but only one is used, so the check
+    # above and the connection below cannot disagree.
+    return str(resolved_addresses[0])
+
+
+class _PinnedHostAdapter(HTTPAdapter):
+    """Open connections against one already-validated address.
+
+    ``validate_public_image_url`` resolves the hostname itself and then hands
+    the URL to requests, which resolves it a second time when it opens the
+    socket. Rebinding the pool's host onto the address that was just checked
+    closes that gap: there is no second lookup to rebind. ``assert_hostname``
+    and the SNI name stay the original hostname, so the certificate is still
+    verified against it -- pinning the address must not quietly weaken TLS,
+    which is what rewriting the URL to an IP literal would do.
+    """
+
+    def __init__(self, address: str, hostname: str) -> None:
+        self._address = address
+        self._hostname = hostname
+        super().__init__()
+
+    # requests >= 2.32.2 takes the pool apart through this hook and rebuilds it
+    # from the returned attributes, so the pin is applied to them.
+    def build_connection_pool_key_attributes(self, request, verify, cert):
+        host_params, pool_kwargs = super().build_connection_pool_key_attributes(
+            request, verify, cert
+        )
+        host_params["host"] = self._address
+        if request.url.lower().startswith("https://"):
+            # TLS settings belong to an HTTPS pool alone: handing either of
+            # these to a plain HTTP pool reaches HTTPConnection as an
+            # unexpected keyword and would break every plain http:// image.
+            pool_kwargs["assert_hostname"] = self._hostname
+            pool_kwargs["server_hostname"] = self._hostname
+        return host_params, pool_kwargs
+
+    # requests < 2.32.2 hands back a finished pool instead, and this project
+    # allows requests>=2.28.2, so the pin needs a second entry point as well:
+    # without it the override above never runs, the address goes back to being
+    # resolved a second time, and the whole check is decorative. The signatures
+    # differ between the two requests versions, so this takes *args; the
+    # installed version only ever calls one of the two hooks.
+    def get_connection(self, *args, **kwargs):
+        pool = super().get_connection(*args, **kwargs)
+        pool.host = self._address
+        if getattr(pool, "scheme", "") == "https":
+            pool.assert_hostname = self._hostname
+            pool.conn_kw["server_hostname"] = self._hostname
+        return pool
+
+
+def _pinned_session(address: str, hostname: str) -> requests.Session:
+    """A session whose every connection goes to ``address``."""
+    session = requests.Session()
+    adapter = _PinnedHostAdapter(address, hostname)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
 
 def download_public_image(
     url: str,
-    get=requests.get,
+    get=None,
     max_bytes: int = _MAX_REMOTE_IMAGE_BYTES,
 ) -> Tuple[bytes, str]:
-    """Download a public image with redirect, type, and size checks."""
+    """Download a public image with redirect, type, and size checks.
+
+    ``get`` is the seam the tests drive; left as None the request goes through
+    a session pinned to the address ``validate_public_image_url`` vetted.
+    """
     current = url
     for _ in range(_MAX_REDIRECTS + 1):
-        validate_public_image_url(current)
-        response = get(
-            current,
-            headers={"User-Agent": "CowAgent/Feishu"},
-            timeout=(5, 15),
-            allow_redirects=False,
-            stream=True,
-        )
+        address = validate_public_image_url(current)
+        hostname = urlparse(current).hostname
+        # Host keeps naming the CDN rather than the pinned address, which is
+        # what a virtual-hosted origin expects to route on.
+        headers = {"User-Agent": "CowAgent/Feishu", "Host": hostname}
+        pinned = _pinned_session(address, hostname) if get is None else nullcontext()
+        with pinned as session:
+            fetch = session.get if get is None else get
+            response = fetch(
+                current,
+                headers=headers,
+                timeout=(5, 15),
+                allow_redirects=False,
+                stream=True,
+            )
 
-        if response.status_code in _REDIRECT_CODES:
-            location = response.headers.get("Location")
-            response.close()
-            if not location:
-                raise ValueError("image redirect has no location")
-            current = urljoin(current, location)
-            continue
+            if response.status_code in _REDIRECT_CODES:
+                location = response.headers.get("Location")
+                response.close()
+                if not location:
+                    raise ValueError("image redirect has no location")
+                current = urljoin(current, location)
+                continue
 
-        if response.status_code != 200:
-            response.close()
-            raise ValueError("image download returned HTTP {}".format(response.status_code))
+            if response.status_code != 200:
+                response.close()
+                raise ValueError("image download returned HTTP {}".format(response.status_code))
 
-        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
-        if not content_type.startswith("image/"):
-            response.close()
-            raise ValueError("remote resource is not an image")
+            content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+            if not content_type.startswith("image/"):
+                response.close()
+                raise ValueError("remote resource is not an image")
 
-        try:
-            content_length = int(response.headers.get("Content-Length") or 0)
-        except (TypeError, ValueError):
-            content_length = 0
-        if content_length > max_bytes:
-            response.close()
-            raise ValueError("remote image is too large")
+            try:
+                content_length = int(response.headers.get("Content-Length") or 0)
+            except (TypeError, ValueError):
+                content_length = 0
+            if content_length > max_bytes:
+                response.close()
+                raise ValueError("remote image is too large")
 
-        chunks = []
-        downloaded = 0
-        try:
-            for chunk in response.iter_content(chunk_size=8192):
-                if not chunk:
-                    continue
-                downloaded += len(chunk)
-                if downloaded > max_bytes:
-                    raise ValueError("remote image is too large")
-                chunks.append(chunk)
-        finally:
-            response.close()
-        return b"".join(chunks), content_type
+            chunks = []
+            downloaded = 0
+            try:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        raise ValueError("remote image is too large")
+                    chunks.append(chunk)
+            finally:
+                response.close()
+            return b"".join(chunks), content_type
 
     raise ValueError("too many image redirects")
 
