@@ -586,6 +586,7 @@ class OpenAICompatibleBot:
 
             payload = {
                 "model": vision_model,
+                "max_tokens": max_tokens,
                 "messages": messages,
             }
             headers = {
