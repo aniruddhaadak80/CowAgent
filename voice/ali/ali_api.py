@@ -50,7 +50,7 @@ def text_to_speech_aliyun(url, text, appkey, token):
 
     response = requests.post(url, headers=headers, data=json.dumps(data), timeout=(5, 60), stream=True)
 
-    if response.status_code == 200 and response.headers['Content-Type'] == 'audio/mpeg':
+    if response.status_code == 200 and response.headers.get('Content-Type') == 'audio/mpeg':
         output_file = TmpDir().path() + "reply-" + str(int(time.time())) + "-" + str(hash(text) & 0x7FFFFFFF) + ".wav"
 
         try:
