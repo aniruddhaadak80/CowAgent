@@ -1336,7 +1336,7 @@ class CloudClient(LinkAIClient):
             return
 
         query = payload.get("query", "")
-        session_id = payload.get("session_id", "cloud_console")
+        session_id = payload.get("session_id") or "cloud_console"
         channel_type = payload.get("channel_type", "")
         # Console user on whose behalf this runs; usage is attributed to them
         # instead of the account this deployment is registered under.
