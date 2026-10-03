@@ -456,12 +456,20 @@ class OpenAICompatibleBot:
             # Handle list content (Claude format with content blocks)
             if isinstance(content, list):
                 # Check if this is a tool result message (user role with tool_result blocks)
-                if role == "user" and any(block.get("type") == "tool_result" for block in content):
+                # A content list can hold a non-block (a bare string from a provider
+                # adapter, a null from a compaction pass), so the membership test and
+                # the loop below both have to skip what is not a dict -- the
+                # assistant branch below and the other converters already do.
+                if role == "user" and any(
+                    isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+                ):
                     # Separate text content and tool_result blocks
                     text_parts = []
                     tool_results = []
 
                     for block in content:
+                        if not isinstance(block, dict):
+                            continue
                         if block.get("type") == "text":
                             text_parts.append(block.get("text", ""))
                         elif block.get("type") == "tool_result":
