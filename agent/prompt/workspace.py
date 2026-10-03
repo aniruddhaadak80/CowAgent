@@ -252,13 +252,22 @@ _ONBOARDING_PLACEHOLDERS = {
 
 
 def _is_onboarding_done(workspace_dir: str) -> bool:
-    """Check if AGENT.md or USER.md has had its name placeholder filled in.
+    """Check whether every identity file has had its name placeholder filled in.
 
     BOOTSTRAP.md itself marks onboarding as pending; this only backs up an agent
     that filled the files but forgot to delete it. Looking at the placeholder
     rather than comparing with the template keeps the check stable across
     template rewording, a language switch, or text added elsewhere in the file.
+
+    Every file, not the first one that happens to be filled. BOOTSTRAP.md
+    carries the questions that fill the *rest* of them, so accepting a single
+    filled file retired the script on the strength of the one answer the user
+    happened to give first: the remaining questions were never asked, and the
+    other file stayed a template for good. A file that is absent or unreadable
+    says nothing either way and is skipped, as before; a workspace where none
+    could be read is not done.
     """
+    filled = []
     for filename, placeholders in _ONBOARDING_PLACEHOLDERS.items():
         path = os.path.join(workspace_dir, filename)
         if not os.path.exists(path):
@@ -268,9 +277,8 @@ def _is_onboarding_done(workspace_dir: str) -> bool:
                 content = f.read()
         except Exception:
             continue
-        if not any(p in content for p in placeholders):
-            return True
-    return False
+        filled.append(not any(p in content for p in placeholders))
+    return bool(filled) and all(filled)
 
 
 # ============= Template content =============
