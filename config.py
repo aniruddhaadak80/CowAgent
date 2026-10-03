@@ -394,9 +394,18 @@ class Config(dict):
 
     # Make sure to return a dictionary to ensure atomic
     def get_user_data(self, user) -> dict:
-        if self.user_datas.get(user) is None:
-            self.user_datas[user] = {}
-        return self.user_datas[user]
+        # setdefault looks the key up and inserts in one step, so two sessions
+        # opening the same brand-new user at the same time cannot each build a
+        # dict and have the second one replace the first: both are handed the
+        # dict that ends up being stored. A get-then-set left a window where the
+        # caller wrote into a dict user_datas no longer held, and every write it
+        # made from there was dropped by the next save_user_datas.
+        data = self.user_datas.setdefault(user, {})
+        if data is None:
+            # Restored from a pickle, so a None can be sitting in there; callers
+            # expect a dict.
+            data = self.user_datas[user] = {}
+        return data
 
     # SECURITY NOTE: pickle.load() can execute arbitrary code during
     # deserialization. This is safe as long as user_datas.pkl is trusted
