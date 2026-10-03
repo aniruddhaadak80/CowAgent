@@ -195,10 +195,21 @@ class DeepSeekBot(Bot, OpenAICompatibleBot):
                 }
             else:
                 response = res.json()
-                error = response.get("error", {})
+                error = response.get("error")
+                # A gateway in front of DeepSeek may report its own failure with
+                # an explicitly null error member and the reason in a sibling
+                # field. Reading that as a dict raises AttributeError, which the
+                # retry loop below swallows as a transport failure -- so the same
+                # doomed request is sent again and the real reason is lost.
+                if isinstance(error, dict):
+                    err_msg = error.get("message")
+                    err_type = error.get("type")
+                else:
+                    err_msg = response.get("detail") or str(response)
+                    err_type = None
                 logger.error(
                     f"[DEEPSEEK] chat failed, status_code={res.status_code}, "
-                    f"msg={error.get('message')}, type={error.get('type')}"
+                    f"msg={err_msg}, type={err_type}"
                 )
                 result = {"completion_tokens": 0, "content": "提问太快啦，请休息一下再问我吧"}
                 need_retry = False
