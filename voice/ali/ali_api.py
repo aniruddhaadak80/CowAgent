@@ -110,25 +110,28 @@ def speech_to_text_aliyun(url, audioContent, appkey, token):
         }
 
     conn = http.client.HTTPSConnection(host, timeout=60)
-    conn.request(method='POST', url=request, body=audioContent, headers=httpHeaders)
-
-    response = conn.getresponse()
-    body = response.read()
     try:
-        body = json.loads(body)
-        status = body['status']
-        if status == 20000000 :
-            result = body['result']
-            if result :
-                logger.info(f"阿里云语音识别到了：{result}")
-            conn.close()
-            return result
-        else :
-            logger.error(f"语音识别失败，状态码: {status}")
-    except ValueError:
-        logger.error(f"语音识别失败，收到非JSON格式的数据: {body}")
-    conn.close()
-    return None
+        conn.request(method='POST', url=request, body=audioContent, headers=httpHeaders)
+
+        response = conn.getresponse()
+        body = response.read()
+        try:
+            body = json.loads(body)
+            status = body['status']
+            if status == 20000000 :
+                result = body['result']
+                if result :
+                    logger.info(f"阿里云语音识别到了：{result}")
+                return result
+            else :
+                logger.error(f"语音识别失败，状态码: {status}")
+        except KeyError:
+            logger.error(f"语音识别失败，响应缺少status字段: {body}")
+        except ValueError:
+            logger.error(f"语音识别失败，收到非JSON格式的数据: {body}")
+        return None
+    finally:
+        conn.close()
 
 
 class AliyunTokenGenerator:
