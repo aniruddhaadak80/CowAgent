@@ -93,7 +93,7 @@ class TencentVoice(Voice):
 
             req = tts_models.TextToVoiceRequest()
             req.Text = text
-            req.SessionId = str(int(time.time()))
+            req.SessionId = str(int(time.time() * 1000))
             req.Volume = 5
             req.Speed = 0
             req.ProjectId = 0
