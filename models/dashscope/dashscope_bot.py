@@ -659,9 +659,14 @@ class DashscopeBot(Bot):
             # Handle list content (Claude format with content blocks)
             if isinstance(content, list):
                 # Check if this is a tool result message (user role with tool_result blocks)
-                if role == "user" and any(block.get("type") == "tool_result" for block in content):
+                if role == "user" and any(
+                    isinstance(block, dict) and block.get("type") == "tool_result"
+                    for block in content
+                ):
                     # Convert each tool_result block to a separate tool message
                     for block in content:
+                        if not isinstance(block, dict):
+                            continue
                         if block.get("type") == "tool_result":
                             dashscope_messages.append({
                                 "role": "tool",
