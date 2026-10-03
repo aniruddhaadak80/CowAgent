@@ -72,4 +72,7 @@ class Query:
             return "success"
         except Exception as exc:
             logger.exception(exc)
-            return exc
+            # WeChat only treats an exact "success" body as an acknowledgement;
+            # anything else (including this exception's text) makes it resend
+            # the same callback, so the message is handled once per retry.
+            return "success"
