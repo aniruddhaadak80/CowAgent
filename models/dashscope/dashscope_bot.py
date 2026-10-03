@@ -459,7 +459,12 @@ class DashscopeBot(Bot):
                         "message": err_msg,
                         "status_code": status_code
                     }
-                    continue
+                    # A failed chunk ends the stream: the SDK keeps handing over
+                    # the chunks the provider had already produced, and those
+                    # are the tail of an answer the provider abandoned. Yielding
+                    # them would show the user a failure notice followed by half
+                    # an answer. DeepSeek / MiniMax / LinkAI all return here.
+                    return
 
                 choices = resp_dict.get("output", {}).get("choices", [])
                 if not choices:
