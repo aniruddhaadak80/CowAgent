@@ -1,5 +1,3 @@
-import time
-
 import web
 from wechatpy import parse_message
 from wechatpy.replies import create_reply
